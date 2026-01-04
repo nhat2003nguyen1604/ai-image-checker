@@ -1,0 +1,122 @@
+{
+  "generated_at": "2026-01-04T01:10:20-0500",
+  "counts": {
+    "real": 1,
+    "ai": 1,
+    "edited": 0,
+    "total": 2
+  },
+  "confusion": {
+    "tp": 0,
+    "tn": 0,
+    "fp": 0,
+    "fn": 0,
+    "unknown": 2,
+    "total": 2
+  },
+  "metrics": {
+    "decided_samples": 0,
+    "total_samples": 2,
+    "abstain_rate": 1.0,
+    "accuracy_decided": 0.0,
+    "precision_ai": 0.0,
+    "recall_ai": 0.0,
+    "f1_ai": 0.0
+  },
+  "notes": {
+    "binary_definition": "ai vs real (unknown = abstain)",
+    "edited_handling": "edited images treated as gt=ai (stricter)"
+  },
+  "samples": [
+    {
+      "path": "eval_data/real/608776099_1391093235806649_3559776474532277502_n.jpg",
+      "gt": "real",
+      "pred_label": "unknown",
+      "pred_bin": "unknown",
+      "confidence": 0.5,
+      "signals": {
+        "width": 1020,
+        "height": 1020,
+        "image_type": "jpeg",
+        "jpeg": true,
+        "sharpness_score": 0.197,
+        "exif": {},
+        "score_ai": 0.0
+      },
+      "extra": {
+        "p_ai_ml": 0.605,
+        "p_ai_combined": 0.454,
+        "combine_weights": {
+          "ml": 0.75,
+          "forensics": 0.25
+        },
+        "ml_meta": {
+          "model_id": "dima806/ai_vs_real_image_detection",
+          "device": "mps",
+          "top2": [
+            [
+              "FAKE",
+              0.6049631834030151
+            ],
+            [
+              "REAL",
+              0.39503687620162964
+            ]
+          ]
+        }
+      },
+      "reasons": [
+        "No EXIF software metadata found (social media often removes EXIF).",
+        "Texture/sharpness score is moderate (0.197).",
+        "Forensics heuristic score_ai = 0.000 (0=real-like, 1=AI-like).",
+        "Local ML model estimated AI probability ≈ 0.605.",
+        "Combined probability used for final decision ≈ 0.454."
+      ]
+    },
+    {
+      "path": "eval_data/ai/608403179_25772924569062004_6105388540809525576_n.jpg",
+      "gt": "ai",
+      "pred_label": "unknown",
+      "pred_bin": "unknown",
+      "confidence": 0.5,
+      "signals": {
+        "width": 1024,
+        "height": 1024,
+        "image_type": "jpeg",
+        "jpeg": true,
+        "sharpness_score": 0.035,
+        "exif": {},
+        "score_ai": 0.05
+      },
+      "extra": {
+        "p_ai_ml": 0.46,
+        "p_ai_combined": 0.358,
+        "combine_weights": {
+          "ml": 0.75,
+          "forensics": 0.25
+        },
+        "ml_meta": {
+          "model_id": "dima806/ai_vs_real_image_detection",
+          "device": "mps",
+          "top2": [
+            [
+              "REAL",
+              0.5399952530860901
+            ],
+            [
+              "FAKE",
+              0.4600047469139099
+            ]
+          ]
+        }
+      },
+      "reasons": [
+        "No EXIF software metadata found (social media often removes EXIF).",
+        "Low texture/sharpness score (0.035) can appear in synthetic or heavily processed images.",
+        "Forensics heuristic score_ai = 0.050 (0=real-like, 1=AI-like).",
+        "Local ML model estimated AI probability ≈ 0.460.",
+        "Combined probability used for final decision ≈ 0.358."
+      ]
+    }
+  ]
+}
