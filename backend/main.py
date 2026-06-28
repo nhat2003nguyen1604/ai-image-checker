@@ -1,368 +1,232 @@
-import time
-from typing import List, Literal
+from __future__ import annotations
+
+from model_detector import apply_hybrid_model
+
+import io
+import os
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from PIL import Image
 
-from forensics import read_exif, is_jpeg, sharpness_score
-from upload_guard import safe_decode_image
-from model import predict_label_confidence
-from explain import build_reasons
-from security import require_api_key, rate_limit
-from logger import audit_analyze, audit_chat
+from typing import Any, Dict
+from fastapi import Request
 
-app = FastAPI()
+from forensics import basic_signals
+from detector import predict
+from storage import save_scan, save_feedback, list_feedback, list_feedback_with_status, set_feedback_status, get_scan_by_id
 
-# Allow Next.js dev server to call FastAPI during development
+def load_dotenv_simple(path: str) -> None:
+    # Loads KEY=VALUE lines into os.environ if not already set.
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        return
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv_simple(os.path.join(BASE_DIR, ".env"))
+
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+API_KEY = os.getenv("API_KEY", "")
+MAX_MB = int(os.getenv("MAX_MB", "10"))
+
+app = FastAPI(title="ai-image-checker-backend", version="1.0.0")
+
+# dev CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
+def require_api_key(request: Request) -> None:
+    if not API_KEY:
+        return
+    got = request.headers.get("x-api-key", "")
+    if got != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
 @app.post("/analyze")
 async def analyze(request: Request, file: UploadFile = File(...)):
-    t0 = time.time()
-    ip = request.client.host if request.client else "unknown"
+    require_api_key(request)
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    content = await file.read()
+
+    if len(content) > MAX_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"File too large (max {MAX_MB}MB)")
 
     try:
-        # --- Security ---
-        require_api_key(request)
-        rate_limit(request)
-
-        # Quick header check (still keep magic-bytes check in safe_decode_image)
-        if not file.content_type or not file.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="File must be an image")
-
-        # Read bytes
-        content = await file.read()
-
-        # Hardened upload validation + safe decode
-        img, img_type = safe_decode_image(content)
-        w, h = img.size
-
-        # ---- Forensics signals ----
-        exif = read_exif(content)
-        jpeg = is_jpeg(content)
-        sharp = sharpness_score(img)
-
-        # ---- Simple heuristic scoring (baseline) ----
-        score_ai = 0.0
-        software = (exif.get("EXIF Software") or exif.get("Image Software") or "").lower()
-
-        ai_keywords = [
-            "stable diffusion",
-            "midjourney",
-            "dall-e",
-            "comfyui",
-            "automatic1111",
-            "firefly",
-            "generative",
-        ]
-        edit_keywords = ["photoshop", "lightroom", "snapseed", "facetune"]
-
-        if any(k in software for k in ai_keywords):
-            score_ai += 0.60
-
-        if any(k in software for k in edit_keywords):
-            score_ai += 0.25
-
-        if sharp < 0.08:
-            score_ai += 0.15
-
-        if len(exif) == 0:
-            score_ai -= 0.10
-
-        score_ai = max(0.0, min(score_ai, 1.0))
-
-        signals = {
-            "width": w,
-            "height": h,
-            "image_type": img_type,
-            "jpeg": jpeg,
-            "sharpness_score": round(sharp, 3),
-            "exif": exif,
-            "score_ai": round(score_ai, 3),
-        }
-
-        # --- Model decision (4B) ---
-        # model.py should define: predict_label_confidence(signals, img) -> (label, confidence, extra)
-        label, confidence, extra = predict_label_confidence(signals, img)
-
-        # Explain why
-        reasons = build_reasons(label, signals, extra)
-
-        latency_ms = int((time.time() - t0) * 1000)
-
-        # Audit log success
-        audit_analyze(
-            ip=ip,
-            method=request.method,
-            path=request.url.path,
-            status_code=200,
-            latency_ms=latency_ms,
-            filename=file.filename,
-            content_type=file.content_type,
-            size_bytes=len(content),
-            image_type=img_type,
-            width=w,
-            height=h,
-            label=label,
-            confidence=round(float(confidence), 3),
-        )
-
-        return {
-            "label": label,
-            "confidence": round(float(confidence), 3),
-            "signals": signals,
-            "extra": extra,
-            "reasons": reasons,
-        }
-
-    except HTTPException as e:
-        latency_ms = int((time.time() - t0) * 1000)
-        audit_analyze(
-            ip=ip,
-            method=request.method,
-            path=request.url.path,
-            status_code=e.status_code,
-            latency_ms=latency_ms,
-            filename=getattr(file, "filename", None),
-            content_type=getattr(file, "content_type", None),
-            blocked_reason=str(e.detail),
-        )
-        raise
-
+        img = Image.open(io.BytesIO(content)).convert("RGB")
     except Exception:
-        latency_ms = int((time.time() - t0) * 1000)
-        audit_analyze(
-            ip=ip,
-            method=request.method,
-            path=request.url.path,
-            status_code=500,
-            latency_ms=latency_ms,
-            filename=getattr(file, "filename", None),
-            content_type=getattr(file, "content_type", None),
-            blocked_reason="Internal server error",
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    # 1) Old detector: metadata/forensics/rules
+    signals = basic_signals(img, content)
+    label, confidence, reasons, extra = predict(img, signals)
+
+    # 2) Create base result object
+    result = {
+        "filename": file.filename,
+        "label": label,
+        "confidence": round(float(confidence), 4),
+        "reasons": reasons,
+        "signals": signals,
+        "extra": extra,
+    }
+
+    # 3) New hybrid detector:
+    #    combines old detector + pretrained model detector
+    result = apply_hybrid_model(result, image_bytes=content)
+
+    # 4) Save final hybrid result
+    scan_obj = save_scan(DATA_DIR, result)
+
+    # 5) Return final hybrid result to frontend
+    return {
+        "scan_id": scan_obj["scan_id"],
+        "label": result.get("label", "unknown"),
+        "confidence": round(float(result.get("confidence", 0.5)), 4),
+        "reasons": result.get("reasons", []),
+        "signals": result.get("signals", {}),
+        "extra": result.get("extra", {}),
+    }
+
+@app.post("/feedback")
+async def feedback(request: Request, payload: Dict[str, Any]):
+    require_api_key(request)
+
+    scan_id = str(payload.get("scan_id") or "").strip()
+    vote = str(payload.get("vote") or "").strip().lower()
+    note = str(payload.get("note") or "").strip()
+
+    if not scan_id:
+        raise HTTPException(status_code=400, detail="scan_id is required")
+    if vote not in ("correct", "wrong"):
+        raise HTTPException(status_code=400, detail="vote must be 'correct' or 'wrong'")
+
+    fb = save_feedback(DATA_DIR, {
+        "scan_id": scan_id,
+        "vote": vote,
+        "note": note,
+    })
+    return {"ok": True, "id": fb["id"]}
+
+@app.post("/chat")
+async def chat(request: Request, payload: Dict[str, Any]):
+    require_api_key(request)
+
+    msg = str(payload.get("message") or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    # Simple helpful chatbot (no external LLM).
+    # Only answers about this website / troubleshooting.
+    text = msg.lower()
+
+    if any(k in text for k in ["scan", "analyze", "upload"]):
+        reply = (
+            "To scan an image: click Upload, choose a JPG/PNG/WebP under 10MB, then click Analyze. "
+            "You will get label, confidence, and reasons."
         )
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-# ---------------------------
-# Chatbot (simple FAQ)
-# ---------------------------
-
-class ChatMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str
-
-
-from typing import Optional, Dict, Any
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-    analysis: Optional[Dict[str, Any]] = None
-
-
-class ChatResponse(BaseModel):
-    reply: str
-
-
-def simple_chatbot_reply(user_text: str, analysis: dict | None = None) -> str:
-    t = (user_text or "").lower().strip()
-
-    # --------- Scope filter (only questions about this website/app) ----------
-    allowed_keywords = [
-        "website", "web", "app", "this site", "this tool", "project",
-        "upload", "analyze", "scan", "result", "label", "confidence", "unknown",
-        "exif", "metadata", "sharpness", "signals", "reasons",
-        "api", "endpoint", "backend", "frontend", "fastapi", "next",
-        "cors", "error", "failed to fetch", "401", "429", "rate limit",
-        "api key", "deploy", "docker", "vercel", "render", "railway", "fly",
-        "privacy", "data", "logs", "audit", "security"
-    ]
-
-    in_scope = any(k in t for k in allowed_keywords)
-    short_ok = len(t.split()) <= 6 and any(x in t for x in ["this", "it", "here", "web", "app"])
-
-    if not in_scope and not short_ok:
-        return (
-            "I can only help with questions related to this website "
-            "(how to use it, what the results mean, or technical issues). "
-            "For questions outside this scope, please contact the website owner."
+    elif any(k in text for k in ["unknown", "confidence", "percent", "reasons"]):
+        reply = (
+            "Unknown means the detector did not see strong signals. Confidence is conservative (capped). "
+            "Reasons list explains which signals were used (EXIF, noise/texture, sharpness)."
         )
-
-    # --------- If analysis context exists, answer specifically ----------
-    # Expected analysis: { label, confidence, reasons, signals, extra }
-    if analysis:
-        label = analysis.get("label")
-        conf = analysis.get("confidence")
-        reasons = analysis.get("reasons") or []
-        signals = analysis.get("signals") or {}
-
-        def _fmt_conf(x):
-            try:
-                return f"{float(x) * 100:.1f}%"
-            except Exception:
-                return "N/A"
-
-        if any(k in t for k in ["why", "explain", "reason"]):
-            if reasons:
-                top = reasons[:5]
-                bullets = "\n".join([f"- {r}" for r in top])
-                return (
-                    "Here’s an explanation based on the image you just scanned:\n"
-                    f"Result: **{label}** (confidence ≈ {_fmt_conf(conf)}).\n"
-                    f"Main reasons:\n{bullets}\n"
-                    "For higher certainty, try using the original image file "
-                    "(not one downloaded from social media) and compare with a few similar images."
-                )
-            else:
-                return (
-                    f"The image was classified as **{label}** (confidence ≈ {_fmt_conf(conf)}), "
-                    "but no detailed reasons are available yet. "
-                    "Please check the “Why this result” section or enable reasons in the backend."
-                )
-
-        if "unknown" in t or "uncertain" in t:
-            exif = signals.get("exif") or {}
-            score_ai = signals.get("score_ai")
-            return (
-                "The image was classified as **unknown** because the system is not confident enough.\n"
-                f"- EXIF metadata: {'present' if len(exif) else 'missing'} "
-                "(social media platforms often remove EXIF)\n"
-                f"- Forensics score_ai = {score_ai}\n"
-                "Using the original camera file usually improves accuracy."
-            )
-
-        if "confidence" in t or "%" in t:
-            return (
-                f"For this image: **{label}**, confidence ≈ {_fmt_conf(conf)}.\n"
-                "Confidence reflects relative certainty, not absolute proof. "
-                "It increases when signals are far from the uncertain zone."
-            )
-
-        if "exif" in t:
-            exif = signals.get("exif") or {}
-            software = (exif.get("EXIF Software") or exif.get("Image Software") or "")
-            if software:
-                return (
-                    f"The EXIF metadata shows Software: “{software}”. "
-                    "This is an important signal when detecting AI pipelines or image editing."
-                )
-            return (
-                "The scanned image contains little or no EXIF metadata. "
-                "Many platforms (e.g., Instagram, Facebook) strip EXIF, "
-                "which reduces detection certainty."
-            )
-
-        if any(k in t for k in ["how", "use", "usage"]):
-            return (
-                "Quick usage guide:\n"
-                "1) Upload an image\n"
-                "2) Click Analyze\n"
-                "3) Review the label, confidence, and “Why this result” section\n"
-                "If the result is unknown, try an original or less-compressed image."
-            )
-
-    # --------- General in-scope fallback ----------
-    if "failed to fetch" in t or "cors" in t:
-        return (
-            "This usually means the frontend cannot reach the backend.\n"
-            "Quick checks:\n"
-            "1) Make sure the backend is running at http://127.0.0.1:8000\n"
-            "2) Open http://127.0.0.1:8000/health to confirm it responds\n"
-            "3) If it’s a CORS issue, allow http://localhost:3000 and http://127.0.0.1:3000."
+    elif any(k in text for k in ["wrong", "feedback"]):
+        reply = (
+            "If the result is wrong, click Wrong, write a short note (why), then Submit. "
+            "Admin will review your note to improve the detector."
+        )
+    elif any(k in text for k in ["error", "cors", "failed", "500", "network"]):
+        reply = (
+            "If you see errors: make sure backend is running on port 8000 and frontend on 3000. "
+            "Also confirm NEXT_PUBLIC_BACKEND_URL is http://127.0.0.1:8000. "
+            "Restart both dev servers after changing .env files."
+        )
+    else:
+        reply = (
+            "I can help with questions about this website (scan, results, feedback, troubleshooting). "
+            "For other questions, please contact the site owner."
         )
 
-    if "401" in t or "unauthorized" in t or "api key" in t:
-        return (
-            "401 means the API key is missing or invalid. "
-            "The frontend must send the `x-api-key` header, "
-            "and the backend must be started with `export APP_API_KEY=...`."
-        )
+    return {"reply": reply}
 
-    if "429" in t or "rate limit" in t:
-        return (
-            "429 indicates you hit the rate limit (too many requests in a short time). "
-            "Please wait a bit or adjust the limits in `security.py`."
-        )
+@app.get("/admin/feedback")
+def admin_feedback(limit: int = 200, only_wrong: int = 0, q: str = "", request: Request = None):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="ADMIN_TOKEN is not set on server.")
 
-    return (
-        "I can help with using this website, understanding results "
-        "(label, confidence, explanations), or troubleshooting. "
-        "What would you like to know?"
-    )
+    got = request.headers.get("x-admin-token", "") if request else ""
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: Request, req: ChatRequest):
-    t0 = time.time()
-    ip = request.client.host if request.client else "unknown"
+    if got != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    items = list_feedback_with_status(DATA_DIR, limit=limit, only_wrong=bool(only_wrong), q=q)
+    return {"items": items}
+
+@app.post("/admin/feedback/status")
+async def admin_feedback_status(payload: Dict[str, Any], request: Request):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="ADMIN_TOKEN is not set on server.")
+
+    got = request.headers.get("x-admin-token", "")
+    if got != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    status = str(payload.get("status") or "").strip().lower()
+
+    target = {
+        "id": payload.get("id"),
+        "scan_id": payload.get("scan_id"),
+        "ts": payload.get("ts"),
+    }
 
     try:
-        require_api_key(request)
-        rate_limit(request)
+        updated = update_feedback_status(DATA_DIR, target, status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid status")
 
-        user_msgs = [m.content for m in req.messages if m.role == "user"]
-        last = user_msgs[-1] if user_msgs else ""
+    if not updated:
+        raise HTTPException(status_code=404, detail="Feedback not found")
 
-        reply = simple_chatbot_reply(last)
+    return {
+        "ok": True,
+        "item": updated,
+    }
 
-        latency_ms = int((time.time() - t0) * 1000)
-        audit_chat(
-            ip=ip,
-            method=request.method,
-            path=request.url.path,
-            status_code=200,
-            latency_ms=latency_ms,
-            user_msg_len=len(last) if last else 0,
-        )
+@app.get("/scan/{scan_id}")
+def get_scan(scan_id: str):
+    item = get_scan_by_id(DATA_DIR, scan_id)
 
-        return ChatResponse(reply=reply)
+    if not item:
+        raise HTTPException(status_code=404, detail="Scan report not found")
 
-    except HTTPException as e:
-        # best effort: try to log blocked
-        user_msgs = [m.content for m in req.messages if m.role == "user"]
-        last = user_msgs[-1] if user_msgs else ""
-
-        latency_ms = int((time.time() - t0) * 1000)
-        audit_chat(
-            ip=ip,
-            method=request.method,
-            path=request.url.path,
-            status_code=e.status_code,
-            latency_ms=latency_ms,
-            user_msg_len=len(last) if last else 0,
-            blocked_reason=str(e.detail),
-        )
-        raise
-
-    except Exception:
-        user_msgs = [m.content for m in req.messages if m.role == "user"]
-        last = user_msgs[-1] if user_msgs else ""
-
-        latency_ms = int((time.time() - t0) * 1000)
-        audit_chat(
-            ip=ip,
-            method=request.method,
-            path=request.url.path,
-            status_code=500,
-            latency_ms=latency_ms,
-            user_msg_len=len(last) if last else 0,
-            blocked_reason="Internal server error",
-        )
-        raise HTTPException(status_code=500, detail="Internal server error")
+    return item

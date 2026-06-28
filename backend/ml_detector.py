@@ -1,77 +1,62 @@
 from __future__ import annotations
-
-from typing import Dict, Any, Tuple
-import os
-import torch
+from dataclasses import dataclass
+from typing import Optional, Tuple
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-# Model that predicts AI-generated vs Real (image classifier)
-# HF page: dima806/ai_vs_real_image_detection
-MODEL_ID = os.getenv("HF_IMAGE_DETECTOR_MODEL", "dima806/ai_vs_real_image_detection")
+# Lazy import to keep boot fast
+_PIPE = None
 
-_processor = None
-_model = None
-_device = None
+@dataclass
+class MLResult:
+    prob_ai: float
+    model_name: str
 
+def _load_pipeline(model_name: str):
+    global _PIPE
+    if _PIPE is not None:
+        return _PIPE
 
-def _get_device() -> torch.device:
-    # Prefer Apple Silicon GPU (MPS) if available, else CPU
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    from transformers import pipeline
 
+    # CPU ok
+    _PIPE = pipeline(
+        task="image-classification",
+        model=model_name,
+        device=-1
+    )
+    return _PIPE
 
-def load_model() -> None:
-    global _processor, _model, _device
-    if _model is not None and _processor is not None:
-        return
-
-    _device = _get_device()
-    _processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-    _model = AutoModelForImageClassification.from_pretrained(MODEL_ID)
-    _model.to(_device)
-    _model.eval()
-
-
-@torch.inference_mode()
-def predict_ai_probability(img: Image.Image) -> Tuple[float, Dict[str, Any]]:
+def predict_prob_ai(img: Image.Image, model_name: str = "Ateeqq/ai-vs-human-image-detector") -> MLResult:
     """
-    Returns:
-      p_ai: float in [0,1] (probability the image is AI-generated)
-      meta: debug info (top label probs)
+    Returns probability that image is AI-generated (0..1)
+    Model outputs labels; we map to AI-vs-real.
     """
-    load_model()
+    pipe = _load_pipeline(model_name)
+    preds = pipe(img)
 
-    inputs = _processor(images=img, return_tensors="pt")
-    inputs = {k: v.to(_device) for k, v in inputs.items()}
-
-    outputs = _model(**inputs)
-    logits = outputs.logits[0]
-    probs = torch.softmax(logits, dim=-1)
-
-    # Build label -> prob map using model config
-    id2label = _model.config.id2label
-    label_probs = {id2label[i]: float(probs[i].item()) for i in range(probs.shape[0])}
-
-    # Try to infer which label means "AI"
-    # Many models use labels like "Fake/Real" or "AI/Real".
-    # We'll treat any label containing these keywords as AI/fake.
-    ai_keys = ["fake", "ai", "generated", "deepfake", "synthetic"]
-
-    p_ai = None
-    for lbl, p in label_probs.items():
-        if any(k in lbl.lower() for k in ai_keys):
-            p_ai = p
+    # preds: list[{"label": "...", "score": ...}]
+    # We try common label patterns.
+    prob_ai = None
+    for p in preds:
+        label = str(p.get("label", "")).lower()
+        score = float(p.get("score", 0.0))
+        if "ai" in label or "generated" in label or "fake" in label:
+            prob_ai = score
             break
 
-    # Fallback: if we can't detect label name, assume class 0 is AI-like
-    if p_ai is None:
-        p_ai = float(probs[0].item())
+    if prob_ai is None:
+        # fallback: if labels are "human"/"real"
+        for p in preds:
+            label = str(p.get("label", "")).lower()
+            score = float(p.get("score", 0.0))
+            if "human" in label or "real" in label or "photograph" in label:
+                prob_ai = 1.0 - score
+                break
 
-    # For debugging: top-2
-    top = sorted(label_probs.items(), key=lambda x: x[1], reverse=True)[:2]
-    meta = {"model_id": MODEL_ID, "device": str(_device), "top2": top}
+    if prob_ai is None:
+        # last fallback: take top-1 and guess
+        top = preds[0] if preds else {"score": 0.5}
+        prob_ai = float(top.get("score", 0.5))
 
-    return float(p_ai), meta
-
+    prob_ai = max(0.0, min(prob_ai, 1.0))
+    return MLResult(prob_ai=prob_ai, model_name=model_name)

@@ -1,631 +1,778 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-type ApiResult = {
-  label: "likely_ai" | "likely_real" | "unknown" | string;
-  confidence: number; // 0..1
-  signals: Record<string, any>;
+type Theme = "light" | "dark";
+
+type AnalyzeResult = {
+  scan_id?: string;
+  label: string;
+  confidence: number;
+  reasons: string[];
+  signals?: Record<string, any>;
   extra?: Record<string, any>;
-  reasons?: string[];
 };
 
-type ChatMsg = { role: "user" | "assistant"; content: string };
+type ScanItem = {
+  scan_id?: string;
+  filename: string;
+  ts: number;
+  label?: string;
+  confidence?: number;
+  cached?: AnalyzeResult;
+};
 
-function clamp01(x: number) {
-  if (Number.isNaN(x)) return 0;
-  return Math.max(0, Math.min(1, x));
+type ChatMsg = {
+  role: "user" | "bot";
+  text: string;
+  ts?: number;
+};
+
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+
+const LS_SCANS = "ai_image_checker_recent_scans_v1";
+const LS_CHAT = "ai_image_checker_chat_v1";
+const LS_THEME = "ai_image_checker_theme_v1";
+
+function niceLabel(label: string) {
+  if (label === "likely_ai") return "Likely AI-generated";
+  if (label === "likely_real") return "Likely Real";
+  return "Unknown";
 }
 
-function labelBadge(label: string) {
-  const base: React.CSSProperties = {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "6px 10px",
-    borderRadius: 999,
-    fontWeight: 800,
-    fontSize: 12,
-    letterSpacing: 0.2,
-    border: "1px solid rgba(0,0,0,0.10)",
+function pct(x: any) {
+  if (typeof x !== "number" || Number.isNaN(x)) return "—";
+  return `${(x * 100).toFixed(1)}%`;
+}
+
+function formatTime(ts: number) {
+  try {
+    return new Date(ts).toLocaleString();
+  } catch {
+    return String(ts);
+  }
+}
+
+function safeJson(obj: any) {
+  try {
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return String(obj);
+  }
+}
+
+function labelBadgeClass(label: string, isDark: boolean) {
+  if (label === "likely_ai") {
+    return isDark
+      ? "bg-rose-500/15 text-rose-200 border-rose-400/30"
+      : "bg-rose-50 text-rose-700 border-rose-200";
+  }
+
+  if (label === "likely_real") {
+    return isDark
+      ? "bg-emerald-500/15 text-emerald-200 border-emerald-400/30"
+      : "bg-emerald-50 text-emerald-700 border-emerald-200";
+  }
+
+  return isDark
+    ? "bg-amber-500/15 text-amber-200 border-amber-400/30"
+    : "bg-amber-50 text-amber-700 border-amber-200";
+}
+
+export default function Page() {
+  const [theme, setTheme] = useState<Theme>("light");
+  const isDark = theme === "dark";
+
+  const [file, setFile] = useState<File | null>(null);
+  const [previewURL, setPreviewURL] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<AnalyzeResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [showSignals, setShowSignals] = useState(false);
+  const [reportCopied, setReportCopied] = useState(false);
+
+  const [recent, setRecent] = useState<ScanItem[]>([]);
+
+  const [vote, setVote] = useState<"correct" | "wrong" | null>(null);
+  const [wrongNoteOpen, setWrongNoteOpen] = useState(false);
+  const [wrongNote, setWrongNote] = useState("");
+  const [fbBusy, setFbBusy] = useState(false);
+  const [fbMsg, setFbMsg] = useState<string | null>(null);
+
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatErr, setChatErr] = useState<string | null>(null);
+  const [chatInput, setChatInput] = useState("");
+  const [chat, setChat] = useState<ChatMsg[]>([]);
+  const chatListRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    try {
+      const savedTheme = localStorage.getItem(LS_THEME);
+      if (savedTheme === "dark" || savedTheme === "light") {
+        setTheme(savedTheme);
+      }
+    } catch {}
+
+    try {
+      const raw = localStorage.getItem(LS_SCANS);
+      if (raw) setRecent(JSON.parse(raw));
+    } catch {}
+
+    try {
+      const raw = localStorage.getItem(LS_CHAT);
+      if (raw) {
+        setChat(JSON.parse(raw));
+      } else {
+        setChat([
+          {
+            role: "bot",
+            text: "Hi! I can help you use this website: scanning, results, feedback, and troubleshooting.",
+            ts: Date.now(),
+          },
+        ]);
+      }
+    } catch {
+      setChat([
+        {
+          role: "bot",
+          text: "Hi! I can help you use this website: scanning, results, feedback, and troubleshooting.",
+          ts: Date.now(),
+        },
+      ]);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_THEME, theme);
+    } catch {}
+  }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_SCANS, JSON.stringify(recent.slice(0, 20)));
+    } catch {}
+  }, [recent]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_CHAT, JSON.stringify(chat.slice(-50)));
+    } catch {}
+  }, [chat]);
+
+  useEffect(() => {
+    if (!chatOpen) return;
+    const el = chatListRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [chatOpen, chat]);
+
+  useEffect(() => {
+    if (!file) {
+      setPreviewURL(null);
+      return;
+    }
+
+    const url = URL.createObjectURL(file);
+    setPreviewURL(url);
+
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+
+  const ui = {
+    page: isDark
+      ? "min-h-screen bg-slate-950 text-slate-100"
+      : "min-h-screen bg-slate-50 text-slate-950",
+    card: isDark
+      ? "rounded-2xl border border-white/10 bg-slate-900 p-5 shadow-sm"
+      : "rounded-2xl border border-slate-200 bg-white p-5 shadow-sm",
+    subCard: isDark
+      ? "rounded-2xl border border-white/10 bg-slate-950 p-4"
+      : "rounded-2xl border border-slate-200 bg-slate-50 p-4",
+    muted: isDark ? "text-slate-400" : "text-slate-600",
+    primaryBtn: isDark
+      ? "rounded-xl bg-white px-4 py-2 text-sm font-semibold text-slate-950 shadow hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+      : "rounded-xl bg-slate-950 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50",
+    secondaryBtn: isDark
+      ? "rounded-xl border border-white/10 bg-slate-800 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700"
+      : "rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-slate-50",
+    smallBtn: isDark
+      ? "rounded-xl border border-white/10 bg-slate-800 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
+      : "rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-slate-50 disabled:opacity-50",
+    input: isDark
+      ? "w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-white/30"
+      : "w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-950 outline-none focus:ring-2 focus:ring-slate-300",
   };
 
-  if (label === "likely_ai") return { ...base, background: "rgba(255, 77, 79, 0.12)" };
-  if (label === "likely_real") return { ...base, background: "rgba(82, 196, 26, 0.12)" };
-  return { ...base, background: "rgba(250, 173, 20, 0.12)" };
+  const canAnalyze = !!file && !busy;
+
+  const signalsText = useMemo(() => {
+    if (!result) return "";
+    return safeJson({ signals: result.signals || {}, extra: result.extra || {} });
+  }, [result]);
+
+  function resetAll() {
+    setFile(null);
+    setPreviewURL(null);
+    setResult(null);
+    setErr(null);
+    setShowSignals(false);
+    setVote(null);
+    setWrongNoteOpen(false);
+    setWrongNote("");
+    setFbMsg(null);
+  }
+
+  async function copyReportLink() {
+  if (!result?.scan_id) return;
+
+  const url = `${window.location.origin}/report/${result.scan_id}`;
+
+  try {
+    await navigator.clipboard.writeText(url);
+    setReportCopied(true);
+    setTimeout(() => setReportCopied(false), 1500);
+  } catch {
+    setReportCopied(false);
+  }
 }
-
-function labelText(label: string) {
-  if (label === "likely_ai") return "Likely AI-generated / AI-edited";
-  if (label === "likely_real") return "Likely Real (camera-origin)";
-  return "Uncertain";
-}
-
-export default function Home() {
-  const [file, setFile] = useState<File | null>(null);
-  const [result, setResult] = useState<ApiResult | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  // Chat states
-  const [chatOpen, setChatOpen] = useState(true);
-  const [chatInput, setChatInput] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
-  const [chatMsgs, setChatMsgs] = useState<ChatMsg[]>([
-    {
-      role: "assistant",
-      content:
-        'Hi! Ask me about "unknown" results, confidence, EXIF, or how the detector works.',
-    },
-  ]);
-
-  const previewUrl = useMemo(() => {
-    if (!file) return null;
-    return URL.createObjectURL(file);
-  }, [file]);
 
   async function analyze() {
     if (!file) return;
 
-    setLoading(true);
+    setBusy(true);
     setErr(null);
     setResult(null);
+    setVote(null);
+    setWrongNoteOpen(false);
+    setWrongNote("");
+    setFbMsg(null);
 
     try {
       const form = new FormData();
       form.append("file", file);
 
-      const r = await fetch("http://127.0.0.1:8000/analyze", {
+      const res = await fetch(`${BACKEND}/analyze`, {
         method: "POST",
-        headers: { "x-api-key": "dev_secret_123" },
+        headers: API_KEY ? { "x-api-key": API_KEY } : undefined,
         body: form,
+        cache: "no-store",
       });
 
-      if (!r.ok) {
-        const t = await r.text();
-        throw new Error(t || "Request failed");
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        const detail = data?.detail;
+        throw new Error(typeof detail === "string" ? detail : `Analyze failed (${res.status})`);
       }
 
-      const data = (await r.json()) as ApiResult;
-      data.confidence = clamp01(data.confidence);
+      const data = (await res.json()) as AnalyzeResult;
       setResult(data);
 
-      // Optional: after analyzing, add a helpful assistant message
-      setChatMsgs((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content:
-            'Analysis complete. You can ask: "Why did it output this label?" or "What does EXIF mean?"',
-        },
-      ]);
+      setRecent((prev) => {
+        const next: ScanItem[] = [
+          {
+            scan_id: data.scan_id,
+            filename: file.name,
+            ts: Date.now(),
+            label: data.label,
+            confidence: data.confidence,
+            cached: data,
+          },
+          ...prev,
+        ];
+
+        const seen = new Set<string>();
+        const dedup: ScanItem[] = [];
+
+        for (const it of next) {
+          const key = it.scan_id || `${it.filename}-${it.ts}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          dedup.push(it);
+        }
+
+        return dedup.slice(0, 20);
+      });
     } catch (e: any) {
-      setErr(e?.message || "Request failed");
+      setErr(e?.message || "Analyze failed");
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
+  }
+
+  async function sendFeedback(v: "correct" | "wrong", note?: string) {
+    if (!result?.scan_id) return;
+
+    setFbBusy(true);
+    setFbMsg(null);
+
+    try {
+      const res = await fetch(`${BACKEND}/feedback`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(API_KEY ? { "x-api-key": API_KEY } : {}),
+        },
+        body: JSON.stringify({
+          scan_id: result.scan_id,
+          vote: v,
+          note: note || "",
+        }),
+        cache: "no-store",
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        const detail = data?.detail;
+        throw new Error(typeof detail === "string" ? detail : `Feedback failed (${res.status})`);
+      }
+
+      setVote(v);
+      setFbMsg(v === "wrong" ? "Thanks - your feedback was sent to admin." : "Thanks - marked as correct.");
+    } catch (e: any) {
+      setFbMsg(e?.message || "Failed to send feedback");
+    } finally {
+      setFbBusy(false);
+    }
+  }
+
+  function onWrongClick() {
+    setVote(null);
+    setFbMsg(null);
+    setWrongNoteOpen(true);
+  }
+
+  async function submitWrongNote() {
+    const note = wrongNote.trim();
+
+    if (!note) {
+      setFbMsg("Please write a short note first.");
+      return;
+    }
+
+    await sendFeedback("wrong", note);
+    setWrongNoteOpen(false);
+    setWrongNote("");
   }
 
   async function sendChat() {
     const text = chatInput.trim();
-    if (!text || chatLoading) return;
+    if (!text) return;
 
-    const next: ChatMsg[] = [...chatMsgs, { role: "user", content: text }];
-    setChatMsgs(next);
+    setChatErr(null);
+    setChatBusy(true);
     setChatInput("");
-    setChatLoading(true);
+    setChat((prev) => [...prev, { role: "user", text, ts: Date.now() }]);
 
     try {
-      const r = await fetch("http://127.0.0.1:8000/chat", {
+      const res = await fetch(`${BACKEND}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "dev_secret_123" },
-        body: JSON.stringify({ messages: next }),
+        headers: {
+          "Content-Type": "application/json",
+          ...(API_KEY ? { "x-api-key": API_KEY } : {}),
+        },
+        body: JSON.stringify({
+          message: text,
+          context: { last_result: result ?? null },
+        }),
+        cache: "no-store",
       });
 
-      if (!r.ok) {
-        const t = await r.text();
-        throw new Error(t || "Chat request failed");
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        const detail = data?.detail;
+        throw new Error(typeof detail === "string" ? detail : `Chat failed (${res.status})`);
       }
 
-      const data = await r.json();
-      setChatMsgs([...next, { role: "assistant", content: data.reply }]);
+      const data = (await res.json()) as { reply: string };
+      setChat((prev) => [...prev, { role: "bot", text: data.reply || "OK.", ts: Date.now() }]);
     } catch (e: any) {
-      setChatMsgs([
-        ...next,
-        { role: "assistant", content: "Chat error: " + (e?.message || "failed") },
-      ]);
+      const msg = e?.message || "Chat failed";
+      setChatErr(msg);
+      setChat((prev) => [...prev, { role: "bot", text: `Sorry - chat failed. ${msg}`, ts: Date.now() }]);
     } finally {
-      setChatLoading(false);
+      setChatBusy(false);
     }
   }
 
-  const confPct = result ? Math.round(clamp01(result.confidence) * 1000) / 10 : 0;
+  function clearChat() {
+    setChat([
+      {
+        role: "bot",
+        text: "Hi! I can help you use this website: scanning, results, feedback, and troubleshooting.",
+        ts: Date.now(),
+      },
+    ]);
+    setChatErr(null);
+  }
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background:
-          "radial-gradient(1200px 600px at 10% 10%, rgba(24,144,255,0.10), transparent 60%), radial-gradient(900px 500px at 90% 20%, rgba(82,196,26,0.10), transparent 55%), #ffffff",
-        padding: 24,
-        fontFamily:
-          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif',
-        color: "#111827",
-      }}
-    >
-      <div style={{ maxWidth: 980, margin: "0 auto" }}>
-        {/* Header */}
-        <div style={{ marginBottom: 18 }}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "flex-start",
-              justifyContent: "space-between",
-              gap: 16,
-              flexWrap: "wrap",
-            }}
+    <div className={ui.page}>
+      <div className="mx-auto max-w-6xl px-4 py-8">
+        <header className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className={`text-sm font-semibold ${ui.muted}`}>Explainable AI Image Detection</div>
+            <h1 className="mt-1 text-4xl font-bold tracking-tight">AI Image Checker</h1>
+            <p className={`mt-2 max-w-2xl text-sm ${ui.muted}`}>
+              Upload an image and get a conservative result with confidence, reasons, forensic signals, feedback, and history.
+            </p>
+          </div>
+
+          <button
+            onClick={() => setTheme((v) => (v === "light" ? "dark" : "light"))}
+            className={ui.secondaryBtn}
           >
-            <div>
-              <h1 style={{ margin: 0, fontSize: 28, letterSpacing: -0.4 }}>
-                AI Image Authenticity Checker
-              </h1>
-              <p style={{ marginTop: 8, marginBottom: 0, color: "#4B5563" }}>
-                Upload an image to estimate whether it looks AI-generated or edited,
-                and review forensic signals.
-              </p>
+            {isDark ? "Light mode" : "Dark mode"}
+          </button>
+        </header>
+
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1.05fr_0.95fr]">
+          <section className={ui.card}>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-bold">Upload image</h2>
+                <p className={`mt-1 text-sm ${ui.muted}`}>JPEG, PNG, or WebP. Max 10MB.</p>
+              </div>
+              <span
+                className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+                  isDark ? "border-white/10 text-slate-300" : "border-slate-200 text-slate-600"
+                }`}
+              >
+                Local demo
+              </span>
             </div>
 
             <div
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 10,
-                padding: "10px 12px",
-                borderRadius: 14,
-                border: "1px solid rgba(0,0,0,0.08)",
-                background: "rgba(255,255,255,0.75)",
-                backdropFilter: "blur(6px)",
-              }}
+              className={`mt-5 rounded-2xl border border-dashed p-5 ${
+                isDark ? "border-white/15 bg-slate-950" : "border-slate-300 bg-slate-50"
+              }`}
             >
-              <span style={{ fontSize: 12, color: "#6B7280" }}>Backend:</span>
-              <span
-                style={{
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                  fontSize: 12,
-                }}
-              >
-                http://127.0.0.1:8000
-              </span>
-            </div>
-          </div>
-        </div>
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                className={`block w-full text-sm ${
+                  isDark
+                    ? "file:mr-4 file:rounded-lg file:border file:border-white/10 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:bg-slate-700"
+                    : "file:mr-4 file:rounded-lg file:border file:border-slate-300 file:bg-white file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-950 hover:file:bg-slate-100"
+                }`}
+              />
 
-        {/* Layout */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: 16,
-          }}
-        >
-          {/* Left: Upload + Preview */}
-          <section
-            style={{
-              border: "1px solid rgba(0,0,0,0.08)",
-              borderRadius: 18,
-              padding: 16,
-              background: "rgba(255,255,255,0.85)",
-              boxShadow: "0 8px 22px rgba(17,24,39,0.06)",
-            }}
-          >
-            <h2 style={{ margin: 0, fontSize: 16 }}>Upload</h2>
-            <p style={{ marginTop: 8, color: "#6B7280", fontSize: 13 }}>
-              Supported: JPG/PNG/WebP. Best results with original files (not heavily compressed).
-            </p>
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button onClick={analyze} disabled={!canAnalyze} className={ui.primaryBtn}>
+                  {busy ? "Analyzing..." : "Analyze"}
+                </button>
 
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "10px 12px",
-                  borderRadius: 14,
-                  border: "1px solid rgba(0,0,0,0.10)",
-                  background: "white",
-                  cursor: "pointer",
-                }}
-              >
-                <span style={{ fontWeight: 800, fontSize: 13 }}>Choose file</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  style={{ display: "none" }}
-                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                />
-              </label>
-
-              <button
-                onClick={analyze}
-                disabled={!file || loading}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 14,
-                  border: "1px solid rgba(0,0,0,0.10)",
-                  background: !file || loading ? "#F3F4F6" : "#111827",
-                  color: !file || loading ? "#6B7280" : "white",
-                  fontWeight: 900,
-                  fontSize: 13,
-                  cursor: !file || loading ? "not-allowed" : "pointer",
-                }}
-              >
-                {loading ? "Analyzing…" : "Analyze"}
-              </button>
-
-              {file && (
-                <button
-                  onClick={() => {
-                    setFile(null);
-                    setResult(null);
-                    setErr(null);
-                  }}
-                  disabled={loading}
-                  style={{
-                    padding: "10px 14px",
-                    borderRadius: 14,
-                    border: "1px solid rgba(0,0,0,0.10)",
-                    background: "white",
-                    fontWeight: 800,
-                    fontSize: 13,
-                    cursor: loading ? "not-allowed" : "pointer",
-                  }}
-                >
+                <button onClick={resetAll} className={ui.secondaryBtn}>
                   Reset
                 </button>
-              )}
+              </div>
             </div>
 
-            <div style={{ marginTop: 14 }}>
+            <div
+              className={`mt-5 rounded-2xl border p-4 ${
+                isDark ? "border-white/10 bg-slate-950" : "border-slate-200 bg-slate-50"
+              }`}
+            >
+              <div className="text-sm font-bold">Preview</div>
+
               <div
-                style={{
-                  borderRadius: 16,
-                  border: "1px dashed rgba(0,0,0,0.18)",
-                  background: "rgba(249,250,251,0.9)",
-                  padding: 12,
-                  minHeight: 280,
-                  display: "grid",
-                  placeItems: "center",
-                  overflow: "hidden",
-                }}
+                className={`mt-3 overflow-hidden rounded-xl border ${
+                  isDark ? "border-white/10 bg-black" : "border-slate-200 bg-white"
+                }`}
               >
-                {!previewUrl ? (
-                  <div style={{ textAlign: "center", color: "#6B7280" }}>
-                    <div style={{ fontSize: 40, marginBottom: 8 }}>🖼️</div>
-                    <div style={{ fontWeight: 800 }}>No image selected</div>
-                    <div style={{ fontSize: 13, marginTop: 6 }}>
-                      Choose a file to preview it here.
-                    </div>
-                  </div>
-                ) : (
+                {previewURL ? (
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={previewUrl}
-                    alt="Preview"
-                    style={{
-                      width: "100%",
-                      height: 320,
-                      objectFit: "contain",
-                      borderRadius: 12,
-                      background: "white",
-                    }}
-                  />
+                  <img src={previewURL} alt="preview" className="h-[280px] w-full object-contain" />
+                ) : (
+                  <div className={`flex h-[180px] items-center justify-center text-sm ${ui.muted}`}>
+                    No image selected.
+                  </div>
                 )}
               </div>
-
-              {file && (
-                <div style={{ marginTop: 10, color: "#6B7280", fontSize: 12 }}>
-                  <b style={{ color: "#111827" }}>Selected:</b> {file.name} •{" "}
-                  {Math.round(file.size / 1024)} KB
-                </div>
-              )}
             </div>
-
-            {err && (
-              <div
-                style={{
-                  marginTop: 14,
-                  padding: 12,
-                  borderRadius: 14,
-                  border: "1px solid rgba(255,77,79,0.25)",
-                  background: "rgba(255,77,79,0.08)",
-                  color: "#B91C1C",
-                  fontSize: 13,
-                }}
-              >
-                <b>Error:</b> {err}
-              </div>
-            )}
           </section>
 
-          {/* Right: Result + Chat */}
-          <section
-            style={{
-              border: "1px solid rgba(0,0,0,0.08)",
-              borderRadius: 18,
-              padding: 16,
-              background: "rgba(255,255,255,0.85)",
-              boxShadow: "0 8px 22px rgba(17,24,39,0.06)",
-            }}
-          >
-            <h2 style={{ margin: 0, fontSize: 16 }}>Result</h2>
-            <p style={{ marginTop: 8, color: "#6B7280", fontSize: 13 }}>
-              This is an estimate. Use it as a signal, not definitive proof.
-            </p>
-
-            {!result ? (
-              <div
-                style={{
-                  marginTop: 12,
-                  borderRadius: 16,
-                  border: "1px solid rgba(0,0,0,0.08)",
-                  background: "rgba(249,250,251,0.9)",
-                  padding: 16,
-                  minHeight: 170,
-                  display: "grid",
-                  placeItems: "center",
-                  color: "#6B7280",
-                  textAlign: "center",
-                }}
-              >
-                <div>
-                  <div style={{ fontSize: 40, marginBottom: 8 }}>🔎</div>
-                  <div style={{ fontWeight: 800 }}>No analysis yet</div>
-                  <div style={{ fontSize: 13, marginTop: 6 }}>
-                    Upload an image and click Analyze to see results.
-                  </div>
-                </div>
+          <section className={ui.card}>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold">Result report</h2>
+                <p className={`mt-1 text-sm ${ui.muted}`}>Decision, confidence, and explanation.</p>
               </div>
-            ) : (
-              <>
-                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <span style={labelBadge(result.label)}>{labelText(result.label)}</span>
-                  <span style={{ color: "#6B7280", fontSize: 13 }}>
-                    Confidence: <b style={{ color: "#111827" }}>{confPct}%</b>
-                  </span>
-                </div>
 
-                {/* Confidence bar */}
-                <div style={{ marginTop: 12 }}>
-                  <div
-                    style={{
-                      height: 10,
-                      borderRadius: 999,
-                      background: "rgba(0,0,0,0.06)",
-                      overflow: "hidden",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: `${clamp01(result.confidence) * 100}%`,
-                        height: "100%",
-                        background: "rgba(17,24,39,0.85)",
-                      }}
-                    />
-                  </div>
-                  <div style={{ marginTop: 8, fontSize: 12, color: "#6B7280" }}>
-                    Confidence increases as the prediction moves further from the uncertain zone.
-                  </div>
-                </div>
+              <button onClick={() => setShowSignals((v) => !v)} disabled={!result} className={ui.smallBtn}>
+                {showSignals ? "Hide signals" : "View signals"}
+              </button>
+            </div>
 
-                {/* Explain Why */}
-                {result.reasons && result.reasons.length > 0 && (
-                  <div style={{ marginTop: 12 }}>
-                    <div style={{ fontWeight: 900, fontSize: 13, marginBottom: 8 }}>
-                      Why this result
-                    </div>
-                    <ul
-                      style={{
-                        margin: 0,
-                        paddingLeft: 18,
-                        color: "#374151",
-                        fontSize: 13,
-                        lineHeight: 1.45,
-                      }}
-                    >
-                      {result.reasons.map((r, i) => (
-                        <li key={i} style={{ marginBottom: 6 }}>
-                          {r}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                {/* Details */}
-                <div style={{ marginTop: 14 }}>
-                  <details
-                    style={{
-                      border: "1px solid rgba(0,0,0,0.08)",
-                      borderRadius: 14,
-                      padding: 12,
-                      background: "rgba(249,250,251,0.9)",
-                    }}
-                  >
-                    <summary style={{ cursor: "pointer", fontWeight: 900, fontSize: 13 }}>
-                      Show forensic signals
-                    </summary>
-                    <pre
-                      style={{
-                        marginTop: 10,
-                        fontSize: 12,
-                        overflowX: "auto",
-                        padding: 10,
-                        borderRadius: 12,
-                        background: "white",
-                        border: "1px solid rgba(0,0,0,0.08)",
-                      }}
-                    >
-                      {JSON.stringify(result.signals, null, 2)}
-                    </pre>
-                  </details>
-
-                  {result.extra && (
-                    <details
-                      style={{
-                        marginTop: 10,
-                        border: "1px solid rgba(0,0,0,0.08)",
-                        borderRadius: 14,
-                        padding: 12,
-                        background: "rgba(249,250,251,0.9)",
-                      }}
-                    >
-                      <summary style={{ cursor: "pointer", fontWeight: 900, fontSize: 13 }}>
-                        Show model debug (optional)
-                      </summary>
-                      <pre
-                        style={{
-                          marginTop: 10,
-                          fontSize: 12,
-                          overflowX: "auto",
-                          padding: 10,
-                          borderRadius: 12,
-                          background: "white",
-                          border: "1px solid rgba(0,0,0,0.08)",
-                        }}
-                      >
-                        {JSON.stringify(result.extra, null, 2)}
-                      </pre>
-                    </details>
-                  )}
-                </div>
-              </>
+            {!result && !err && (
+              <div
+                className={`mt-5 rounded-2xl border p-5 text-sm ${
+                  isDark ? "border-white/10 bg-slate-950 text-slate-400" : "border-slate-200 bg-slate-50 text-slate-600"
+                }`}
+              >
+                Upload an image and click Analyze.
+              </div>
             )}
 
-            {/* Chatbot panel */}
-            <div style={{ marginTop: 14 }}>
-              <div
-                style={{
-                  border: "1px solid rgba(0,0,0,0.08)",
-                  borderRadius: 14,
-                  background: "rgba(249,250,251,0.9)",
-                  overflow: "hidden",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "10px 12px",
-                    background: "rgba(255,255,255,0.9)",
-                    borderBottom: "1px solid rgba(0,0,0,0.06)",
-                  }}
-                >
-                  <div style={{ fontWeight: 900, fontSize: 13 }}>Assistant</div>
-                  <button
-                    onClick={() => setChatOpen(!chatOpen)}
-                    style={{
-                      padding: "6px 10px",
-                      borderRadius: 12,
-                      border: "1px solid rgba(0,0,0,0.10)",
-                      background: "white",
-                      fontWeight: 800,
-                      fontSize: 12,
-                      cursor: "pointer",
-                    }}
-                  >
-                    {chatOpen ? "Hide" : "Show"}
-                  </button>
+            {err && (
+              <div className="mt-5 rounded-2xl border border-rose-300 bg-rose-50 p-4 text-sm text-rose-700">
+                {err}
+              </div>
+            )}
+
+            {result && (
+              <div className="mt-5 space-y-4">
+                <div className={ui.subCard}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`rounded-full border px-3 py-1 text-xs font-bold ${labelBadgeClass(result.label, isDark)}`}>
+                      {niceLabel(result.label)}
+                    </span>
+                    <span className={`text-xs ${ui.muted}`}>Scan ID: {result.scan_id || "—"}</span>
+                  </div>
+                  {result.scan_id && (
+  <button
+    onClick={copyReportLink}
+    className={ui.smallBtn}
+  >
+    {reportCopied ? "Report link copied!" : "Copy report link"}
+  </button>
+)}
+
+                  <div className="mt-4">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="font-semibold">Confidence</span>
+                      <span className={ui.muted}>{pct(result.confidence)}</span>
+                    </div>
+
+                    <div className={`mt-2 h-3 overflow-hidden rounded-full ${isDark ? "bg-slate-800" : "bg-slate-200"}`}>
+                      <div
+                        className={isDark ? "h-full rounded-full bg-white transition-all" : "h-full rounded-full bg-slate-950 transition-all"}
+                        style={{ width: `${Math.max(0, Math.min(100, (result.confidence || 0) * 100))}%` }}
+                      />
+                    </div>
+                  </div>
                 </div>
 
-                {chatOpen && (
-                  <>
-                    <div
-                      style={{
-                        maxHeight: 220,
-                        overflowY: "auto",
-                        padding: 12,
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: 10,
-                      }}
-                    >
-                      {chatMsgs.map((m, i) => (
-                        <div
-                          key={i}
-                          style={{
-                            alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-                            background: m.role === "user" ? "rgba(17,24,39,0.08)" : "white",
-                            border: "1px solid rgba(0,0,0,0.08)",
-                            borderRadius: 14,
-                            padding: "10px 12px",
-                            maxWidth: "85%",
-                            fontSize: 13,
-                            lineHeight: 1.35,
-                          }}
-                        >
-                          {m.content}
-                        </div>
-                      ))}
-                      {chatLoading && (
-                        <div style={{ color: "#6B7280", fontSize: 12 }}>Thinking…</div>
-                      )}
-                    </div>
+                <div>
+                  <div className="text-sm font-bold">Why this result</div>
+                  <ul className={`mt-2 list-disc space-y-1 pl-5 text-sm ${isDark ? "text-slate-300" : "text-slate-700"}`}>
+                    {result.reasons?.length ? result.reasons.map((r, idx) => <li key={idx}>{r}</li>) : <li>No reasons returned.</li>}
+                  </ul>
+                </div>
 
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: 10,
-                        padding: 12,
-                        borderTop: "1px solid rgba(0,0,0,0.06)",
-                        background: "rgba(255,255,255,0.9)",
-                      }}
+                {showSignals && (
+                  <div className={ui.subCard}>
+                    <div className="text-sm font-bold">Signals debug</div>
+                    <pre
+                      className={`mt-2 max-h-[260px] overflow-auto rounded-xl border p-3 text-xs ${
+                        isDark ? "border-white/10 bg-black text-slate-300" : "border-slate-200 bg-white text-slate-800"
+                      }`}
                     >
-                      <input
-                        value={chatInput}
-                        onChange={(e) => setChatInput(e.target.value)}
-                        placeholder='Try: "Why is it unknown?"'
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") sendChat();
-                        }}
-                        style={{
-                          flex: 1,
-                          padding: "10px 12px",
-                          borderRadius: 14,
-                          border: "1px solid rgba(0,0,0,0.10)",
-                          outline: "none",
-                          fontSize: 13,
-                          background: "white",
-                        }}
-                      />
-                      <button
-                        onClick={sendChat}
-                        disabled={chatLoading || !chatInput.trim()}
-                        style={{
-                          padding: "10px 14px",
-                          borderRadius: 14,
-                          border: "1px solid rgba(0,0,0,0.10)",
-                          background: chatLoading || !chatInput.trim() ? "#F3F4F6" : "#111827",
-                          color: chatLoading || !chatInput.trim() ? "#6B7280" : "white",
-                          fontWeight: 900,
-                          fontSize: 13,
-                          cursor: chatLoading || !chatInput.trim() ? "not-allowed" : "pointer",
-                        }}
-                      >
-                        Send
-                      </button>
-                    </div>
-                  </>
+                      {signalsText || "{}"}
+                    </pre>
+                  </div>
                 )}
+
+                <div className={ui.subCard}>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="text-sm font-bold">Feedback</div>
+
+                    <button
+                      onClick={() => {
+                        setWrongNoteOpen(false);
+                        setWrongNote("");
+                        sendFeedback("correct");
+                      }}
+                      disabled={fbBusy || !result.scan_id}
+                      className={`rounded-xl px-3 py-2 text-xs font-bold ${
+                        vote === "correct"
+                          ? "bg-emerald-600 text-white"
+                          : isDark
+                            ? "border border-white/10 bg-slate-800 text-white hover:bg-slate-700"
+                            : "border border-slate-300 bg-white text-slate-950 hover:bg-slate-50"
+                      }`}
+                    >
+                      Correct
+                    </button>
+
+                    <button
+                      onClick={onWrongClick}
+                      disabled={fbBusy || !result.scan_id}
+                      className={`rounded-xl px-3 py-2 text-xs font-bold ${
+                        vote === "wrong"
+                          ? "bg-rose-600 text-white"
+                          : isDark
+                            ? "border border-white/10 bg-slate-800 text-white hover:bg-slate-700"
+                            : "border border-slate-300 bg-white text-slate-950 hover:bg-slate-50"
+                      }`}
+                    >
+                      Wrong
+                    </button>
+
+                    {fbBusy && <span className={`text-xs ${ui.muted}`}>Sending...</span>}
+                  </div>
+
+                  {fbMsg && <div className={`mt-2 text-sm ${ui.muted}`}>{fbMsg}</div>}
+
+                  {wrongNoteOpen && (
+                    <div
+                      className={`mt-3 rounded-xl border p-3 ${
+                        isDark ? "border-white/10 bg-slate-900" : "border-slate-200 bg-white"
+                      }`}
+                    >
+                      <div className="text-sm font-bold">Tell us what went wrong</div>
+                      <textarea
+                        value={wrongNote}
+                        onChange={(e) => setWrongNote(e.target.value)}
+                        placeholder="Example: This is a real iPhone photo, but the model says AI."
+                        className={`${ui.input} mt-2 min-h-[90px]`}
+                      />
+
+                      <div className="mt-2 flex gap-2">
+                        <button onClick={submitWrongNote} disabled={fbBusy} className={ui.primaryBtn}>
+                          Submit feedback
+                        </button>
+
+                        <button
+                          onClick={() => {
+                            setWrongNoteOpen(false);
+                            setWrongNote("");
+                          }}
+                          className={ui.secondaryBtn}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
           </section>
         </div>
 
-        <footer style={{ marginTop: 18, color: "#6B7280", fontSize: 12 }}>
-          Tip: Social media images often remove EXIF metadata, so results can be less certain.
-        </footer>
+        <section className={`${ui.card} mt-6`}>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-bold">Recent scans</h2>
+              <p className={`mt-1 text-sm ${ui.muted}`}>Stored locally in this browser.</p>
+            </div>
+
+            <button onClick={() => setRecent([])} className={ui.smallBtn}>
+              Clear
+            </button>
+          </div>
+
+          {recent.length === 0 ? (
+            <p className={`mt-4 text-sm ${ui.muted}`}>No recent scans yet.</p>
+          ) : (
+            <div className="mt-4 space-y-2">
+              {recent.map((it, idx) => (
+                <button
+                  key={`${it.scan_id || it.ts}-${idx}`}
+                  onClick={() => {
+                    if (it.cached) {
+                      setResult(it.cached);
+                      setErr(null);
+                      setVote(null);
+                      setWrongNoteOpen(false);
+                      setWrongNote("");
+                      setFbMsg(null);
+                    }
+                  }}
+                  className={`flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-3 text-left ${
+                    isDark ? "border-white/10 bg-slate-950 hover:bg-slate-900" : "border-slate-200 bg-white hover:bg-slate-50"
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-bold">{it.filename}</div>
+                    <div className={`text-xs ${ui.muted}`}>{formatTime(it.ts)}</div>
+                  </div>
+
+                  <div className={`shrink-0 text-xs ${ui.muted}`}>
+                    {it.label ? `${niceLabel(it.label)} · ${pct(it.confidence)}` : "—"}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
       </div>
-    </main>
+
+      <button
+        onClick={() => setChatOpen((v) => !v)}
+        className={
+          isDark
+            ? "fixed bottom-5 right-5 z-50 flex h-12 w-12 items-center justify-center rounded-full bg-white text-slate-950 shadow-lg hover:bg-slate-200"
+            : "fixed bottom-5 right-5 z-50 flex h-12 w-12 items-center justify-center rounded-full bg-slate-950 text-white shadow-lg hover:bg-slate-800"
+        }
+        aria-label="Open chat"
+        title="Chat"
+      >
+        AI
+      </button>
+
+      {chatOpen && (
+        <div
+          className={`fixed bottom-20 right-5 z-50 w-[360px] max-w-[92vw] overflow-hidden rounded-2xl border shadow-2xl ${
+            isDark ? "border-white/10 bg-slate-950 text-white" : "border-slate-200 bg-white text-slate-950"
+          }`}
+        >
+          <div className={`flex items-center justify-between border-b px-3 py-2 ${isDark ? "border-white/10" : "border-slate-200"}`}>
+            <div className="text-sm font-bold">Support Chat</div>
+
+            <div className="flex gap-2">
+              <button onClick={clearChat} className={ui.smallBtn}>
+                Clear
+              </button>
+              <button onClick={() => setChatOpen(false)} className={ui.smallBtn}>
+                Close
+              </button>
+            </div>
+          </div>
+
+          <div ref={chatListRef} className="max-h-[340px] overflow-auto px-3 py-3">
+            {chat.map((m, i) => (
+              <div key={i} className={`mb-2 flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                <div
+                  className={`max-w-[85%] rounded-2xl px-3 py-2 text-sm ${
+                    m.role === "user"
+                      ? isDark
+                        ? "bg-white text-slate-950"
+                        : "bg-slate-950 text-white"
+                      : isDark
+                        ? "bg-slate-800 text-white"
+                        : "bg-slate-100 text-slate-950"
+                  }`}
+                >
+                  {m.text}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {chatErr && <div className="px-3 pb-2 text-xs text-rose-500">{chatErr}</div>}
+
+          <div className={`flex items-center gap-2 border-t px-3 py-2 ${isDark ? "border-white/10" : "border-slate-200"}`}>
+            <input
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") sendChat();
+              }}
+              placeholder={chatBusy ? "Sending..." : "Ask about scanning, results, errors..."}
+              className={ui.input}
+            />
+
+            <button onClick={sendChat} disabled={chatBusy || !chatInput.trim()} className={ui.primaryBtn}>
+              Send
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
